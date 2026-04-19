@@ -1,0 +1,30 @@
+{
+  "sections": {
+    "world": {
+      "title_th": "โลก / เหตุการณ์ใหญ่",
+      "max_items": 8,
+      "feeds": [
+        {"name": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
+        {"name": "BBC Politics", "url": "https://feeds.bbci.co.uk/news/politics/rss.xml"}
+      ]
+    },
+    "markets": {
+      "title_th": "เศรษฐกิจ / หุ้น / พลังงาน (หัวข้อจากแหล่งข่าว)",
+      "max_items": 8,
+      "feeds": [
+        {"name": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+        {"name": "Yahoo S&P 500 headlines", "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US"},
+        {"name": "Yahoo WTI Oil (CL=F)", "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=CL%3DF&region=US&lang=en-US"}
+      ]
+    },
+    "sports": {
+      "title_th": "กีฬา / ฟุตบอล",
+      "max_items": 8,
+      "feeds": [
+        {"name": "BBC Football", "url": "https://feeds.bbci.co.uk/sport/football/rss.xml"},
+        {"name": "BBC Sport", "url": "https://feeds.bbci.co.uk/sport/rss.xml"}
+      ]
+    }
+  },
+  "note": "แก้ url ใน feeds.json ได้ — ไม่มี API key, ไม่เรียก AI"
+}
