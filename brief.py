@@ -3,6 +3,7 @@
 
 ใช้งาน:
   pip install -r requirements.txt
+  python gui.py           # หน้าต่างเลือกหมวด
   python brief.py
   python brief.py --section world
   python brief.py --no-fetch          # ไม่ดึงเต็มจากลิงก์ (เร็วขึ้น)
@@ -54,10 +55,71 @@ def stable_id(title: str, link: str) -> str:
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        print(f"ไม่พบ {CONFIG_PATH}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(str(CONFIG_PATH))
     with CONFIG_PATH.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def run_brief(
+    *,
+    section_keys: list[str] | None,
+    translate: bool,
+    fetch_body: bool,
+    out_path: Path | None = None,
+) -> tuple[Path, list[str]]:
+    """รันการดึงข่าวและเขียนไฟล์ผลลัพธ์ — คืนค่า (path ไฟล์, รายการข้อความแจ้งปัญหา)"""
+    cfg = load_config()
+    opts = merged_options(cfg)
+    all_sections = cfg.get("sections") or {}
+    all_keys = list(all_sections.keys())
+
+    if section_keys is not None and len(section_keys) == 0:
+        raise ValueError("ต้องเลือกอย่างน้อยหนึ่งหมวด")
+
+    if section_keys is None:
+        sections = all_sections
+        name_suffix = ""
+    else:
+        sections = {}
+        for key in section_keys:
+            if key not in all_sections:
+                raise KeyError(f"ไม่มีหมวดใน feeds.json: {key}")
+            sections[key] = all_sections[key]
+        sel = set(section_keys)
+        full = set(all_keys)
+        name_suffix = ""
+        if sel != full:
+            name_suffix = "-" + "-".join(sorted(section_keys))
+
+    rss_summary_max = int(opts["rss_summary_max_chars"])
+
+    seen: set[str] = set()
+    errors: list[str] = []
+    all_items: dict[str, list[dict]] = {}
+
+    for key, sec in sections.items():
+        rows = collect_section(key, sec, seen, errors, rss_summary_max)
+        enrich_section_items(rows, opts, translate=translate, fetch_body=fetch_body, errors=errors)
+        all_items[key] = rows
+
+    now = datetime.now(timezone.utc)
+    md = render_markdown(
+        now,
+        all_items,
+        errors,
+        translated=translate,
+        fetched_body=fetch_body,
+    )
+
+    final_out = out_path
+    if final_out is None:
+        DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        suf = "-daily-brief-th.md" if translate else "-daily-brief.md"
+        final_out = DEFAULT_OUT_DIR / f"{now.strftime('%Y-%m-%d')}{name_suffix}{suf}"
+
+    final_out.parent.mkdir(parents=True, exist_ok=True)
+    final_out.write_text(md, encoding="utf-8")
+    return final_out.resolve(), errors
 
 
 def merged_options(cfg: dict) -> dict:
@@ -349,46 +411,36 @@ def main() -> None:
     parser.add_argument("--no-fetch", action="store_true", help="ไม่ดึงเนื้อหาเต็มจากลิงก์")
     args = parser.parse_args()
 
-    cfg = load_config()
-    opts = merged_options(cfg)
-    sections = cfg.get("sections") or {}
+    try:
+        cfg = load_config()
+    except FileNotFoundError:
+        print(f"ไม่พบ {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
 
+    opts = merged_options(cfg)
+    sections_map = cfg.get("sections") or {}
+
+    section_keys: list[str] | None = None
     if args.section:
-        if args.section not in sections:
-            print(f"ไม่มีหมวด `{args.section}` — มี: {', '.join(sections)}", file=sys.stderr)
+        if args.section not in sections_map:
+            print(f"ไม่มีหมวด `{args.section}` — มี: {', '.join(sections_map)}", file=sys.stderr)
             sys.exit(1)
-        sections = {args.section: sections[args.section]}
+        section_keys = [args.section]
 
     translate = bool(opts["translate_to_thai"]) and not args.no_translate
     fetch_body = bool(opts["fetch_article_body"]) and not args.no_fetch
-    rss_summary_max = int(opts["rss_summary_max_chars"])
 
-    seen: set[str] = set()
-    errors: list[str] = []
-    all_items: dict[str, list[dict]] = {}
+    try:
+        out_path, errors = run_brief(
+            section_keys=section_keys,
+            translate=translate,
+            fetch_body=fetch_body,
+            out_path=args.out,
+        )
+    except (ValueError, KeyError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
-    for key, sec in sections.items():
-        rows = collect_section(key, sec, seen, errors, rss_summary_max)
-        enrich_section_items(rows, opts, translate=translate, fetch_body=fetch_body, errors=errors)
-        all_items[key] = rows
-
-    now = datetime.now(timezone.utc)
-    md = render_markdown(
-        now,
-        all_items,
-        errors,
-        translated=translate,
-        fetched_body=fetch_body,
-    )
-
-    out_path = args.out
-    if out_path is None:
-        DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)
-        suffix = "-daily-brief-th.md" if translate else "-daily-brief.md"
-        out_path = DEFAULT_OUT_DIR / f"{now.strftime('%Y-%m-%d')}{suffix}"
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(md, encoding="utf-8")
     print(f"เขียนแล้ว: {out_path}")
     if errors:
         print(f"มีคำเตือน {len(errors)} รายการ (ดูในไฟล์)", file=sys.stderr)
