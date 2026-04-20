@@ -1,4 +1,13 @@
 {
+  "options": {
+    "translate_to_thai": true,
+    "fetch_article_body": true,
+    "rss_summary_max_chars": 1500,
+    "max_article_chars": 9000,
+    "translate_chunk_size": 4500,
+    "delay_seconds": 0.35,
+    "max_fulltext_per_section": 8
+  },
   "sections": {
     "world": {
       "title_th": "โลก / เหตุการณ์ใหญ่",
@@ -26,5 +35,5 @@
       ]
     }
   },
-  "note": "แก้ url ใน feeds.json ได้ — ไม่มี API key, ไม่เรียก AI"
+  "note": "แก้ url ใน feeds.json ได้ — แปลภาษาใช้ Google ผ่าน deep-translator (ไม่ใช่ OpenAI) / ดึงเนื้อหาใช้ trafilatura (บางเว็บบล็อกหรือต้องสมัครอ่านไม่ได้)"
 }

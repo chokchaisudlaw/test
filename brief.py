@@ -1,11 +1,12 @@
 """
-สรุปข่าวรายวันแบบง่าย: ดึง RSS แล้วจัดหมวดเป็น Markdown (ไม่ใช้ AI = ไม่เปลืองโทเคน)
+ดึง RSS → (ถ้าเปิด) ดึงเนื้อหาจากหน้าบทความ → แปลเป็นภาษาไทย
 
 ใช้งาน:
   pip install -r requirements.txt
   python brief.py
   python brief.py --section world
-  python brief.py --out my-brief.md
+  python brief.py --no-fetch          # ไม่ดึงเต็มจากลิงก์ (เร็วขึ้น)
+  python brief.py --no-translate      # คงภาษาอังกฤษ แต่ยังดึงเนื้อหาได้
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -22,6 +24,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import feedparser
+import trafilatura
+from deep_translator import GoogleTranslator
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "feeds.json"
@@ -37,7 +41,7 @@ def strip_html(text: str) -> str:
 
 
 def fetch_rss(url: str, timeout: int = 20) -> feedparser.FeedParserDict:
-    req = Request(url, headers={"User-Agent": "daily-news-brief/1.0 (RSS reader; +local)"})
+    req = Request(url, headers={"User-Agent": "daily-news-brief/1.1 (RSS reader; +local)"})
     with urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
     return feedparser.parse(raw)
@@ -56,11 +60,73 @@ def load_config() -> dict:
         return json.load(f)
 
 
+def merged_options(cfg: dict) -> dict:
+    defaults = {
+        "translate_to_thai": True,
+        "fetch_article_body": True,
+        "rss_summary_max_chars": 1500,
+        "max_article_chars": 9000,
+        "translate_chunk_size": 4500,
+        "delay_seconds": 0.35,
+        "max_fulltext_per_section": 8,
+    }
+    opts = cfg.get("options") or {}
+    out = {**defaults, **opts}
+    return out
+
+
+def translate_text(
+    text: str,
+    *,
+    translator: GoogleTranslator | None,
+    chunk_size: int,
+    delay: float,
+    errors: list[str],
+    label: str,
+) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if translator is None:
+        return text
+    parts: list[str] = []
+    try:
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i : i + chunk_size]
+            parts.append(translator.translate(chunk))
+            time.sleep(delay)
+        return "\n".join(parts).strip()
+    except Exception as e:
+        errors.append(f"{label}: {e}")
+        return text
+
+
+def extract_article_text(url: str, max_chars: int, timeout: int = 25) -> tuple[str | None, str | None]:
+    try:
+        downloaded = trafilatura.fetch_url(url, no_ssl=False)
+        if not downloaded:
+            return None, "ดึงหน้าเว็บไม่ได้ (ว่าง)"
+        extracted = trafilatura.extract(
+            downloaded,
+            include_comments=False,
+            include_tables=False,
+        )
+        if not extracted:
+            return None, "แยกเนื้อหาหลักไม่ได้ (เว็บบล็อก/ล็อกอิน/สคริปต์)"
+        plain = re.sub(r"\s+", " ", extracted).strip()
+        if len(plain) > max_chars:
+            plain = plain[:max_chars].rsplit(" ", 1)[0] + " …"
+        return plain, None
+    except Exception as e:
+        return None, str(e)
+
+
 def collect_section(
     section_key: str,
     section: dict,
     seen: set[str],
     errors: list[str],
+    rss_summary_max_chars: int,
 ) -> list[dict]:
     items: list[dict] = []
     max_items = int(section.get("max_items", 10))
@@ -102,7 +168,7 @@ def collect_section(
                 {
                     "title": title,
                     "link": link,
-                    "summary": summary[:400],
+                    "summary": summary[:rss_summary_max_chars],
                     "published": published,
                     "source_feed": name,
                     "section_key": section_key,
@@ -115,16 +181,83 @@ def collect_section(
     return items[:max_items]
 
 
+def enrich_section_items(
+    rows: list[dict],
+    opts: dict,
+    *,
+    translate: bool,
+    fetch_body: bool,
+    errors: list[str],
+) -> None:
+    translator = None
+    if translate:
+        translator = GoogleTranslator(source="auto", target="th")
+
+    chunk = int(opts["translate_chunk_size"])
+    delay = float(opts["delay_seconds"])
+    max_chars = int(opts["max_article_chars"])
+    max_fetch = int(opts["max_fulltext_per_section"])
+
+    for idx, row in enumerate(rows):
+        row["title_th"] = translate_text(
+            row["title"],
+            translator=translator,
+            chunk_size=min(chunk, 500),
+            delay=delay,
+            errors=errors,
+            label=f"แปลหัวข้อ ({row.get('link', '')[:48]})",
+        )
+
+        summary_en = row.get("summary") or ""
+        row["summary_th"] = translate_text(
+            summary_en,
+            translator=translator,
+            chunk_size=chunk,
+            delay=delay,
+            errors=errors,
+            label=f"แปลคำโปรย ({row.get('link', '')[:48]})",
+        )
+
+        row["body_en"] = ""
+        row["body_th"] = ""
+        row["body_note"] = ""
+
+        if fetch_body and idx < max_fetch:
+            body, why = extract_article_text(row["link"], max_chars)
+            if body:
+                row["body_en"] = body
+                row["body_th"] = translate_text(
+                    body,
+                    translator=translator,
+                    chunk_size=chunk,
+                    delay=delay,
+                    errors=errors,
+                    label=f"แปลเนื้อหาเต็ม ({row.get('link', '')[:48]})",
+                )
+            else:
+                row["body_note"] = why or "ไม่ทราบสาเหตุ"
+
+        if not translate:
+            row["title_th"] = row["title"]
+            row["summary_th"] = summary_en
+            row["body_th"] = row.get("body_en") or ""
+
+
 def render_markdown(
     generated_at: datetime,
     all_items: dict[str, list[dict]],
     errors: list[str],
+    *,
+    translated: bool,
+    fetched_body: bool,
 ) -> str:
     lines: list[str] = []
-    lines.append(f"# ข่าวรายวัน (RSS เท่านั้น — ไม่ผ่าน AI)")
+    lines.append("# ข่าวรายวัน (RSS + แปลไทย / ดึงเนื้อหาเมื่อทำได้)")
     lines.append("")
     lines.append(f"- สร้างเมื่อ: `{generated_at.strftime('%Y-%m-%d %H:%M')} UTC`")
-    lines.append("- แหล่งที่มา: ชื่อที่ระบุในแต่ละข้อ — คลิกลิงก์เพื่ออ่านต้นฉบับ")
+    lines.append("- แปลภาษา: Google Translate (ผ่าน `deep-translator`) — อาจผิดพลาดในศัพท์เทคนิค")
+    if fetched_body:
+        lines.append("- เนื้อหายาว: ดึงจากหน้าเว็บด้วย `trafilatura` — บางลิงก์ดึงไม่ได้")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -136,68 +269,123 @@ def render_markdown(
         title_th = rows[0]["section_title_th"]
         lines.append(f"## {title_th}")
         lines.append("")
+
         for i, row in enumerate(rows, 1):
-            lines.append(f"### {i}. {row['title']}")
-            lines.append(f"- ลิงก์: {row['link']}")
-            lines.append(f"- แหล่งฟีด: {row['source_feed']}")
+            display_title = row.get("title_th") or row["title"]
+            lines.append(f"### {i}. {display_title}")
+            lines.append("")
+            lines.append(f"- **ลิงก์ต้นฉบับ:** {row['link']}")
+            lines.append(f"- **แหล่งฟีด:** {row['source_feed']}")
             if row.get("published"):
-                lines.append(f"- เผยแพร่ (จากฟีด): {row['published']}")
-            if row.get("summary"):
-                lines.append(f"- คำโปรยจากฟีด: {row['summary']}")
+                lines.append(f"- **เผยแพร่ (จากฟีด):** {row['published']}")
+            lines.append("")
+
+            if translated:
+                lines.append("#### สรุปจากฟีด (ภาษาไทย)")
+                lines.append("")
+                lines.append(row.get("summary_th") or "—")
+                lines.append("")
+                lines.append("<details><summary>ข้อความจากฟีด (ภาษาอังกฤษ)</summary>")
+                lines.append("")
+                lines.append(row.get("summary") or "—")
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            else:
+                lines.append("#### จากฟีด (อังกฤษ)")
+                lines.append("")
+                lines.append(row.get("summary") or "—")
+                lines.append("")
+
+            if fetched_body:
+                body_th = (row.get("body_th") or "").strip()
+                body_en = (row.get("body_en") or "").strip()
+                note = row.get("body_note") or ""
+
+                if body_th or body_en:
+                    lines.append("#### เนื้อหาจากหน้าบทความ")
+                    lines.append("")
+                    if translated and body_th:
+                        lines.append(body_th)
+                    elif body_en:
+                        lines.append(body_en)
+                    lines.append("")
+                    lines.append("<details><summary>หัวข้อภาษาอังกฤษ (ต้นฉบับฟีด)</summary>")
+                    lines.append("")
+                    lines.append(row.get("title") or "—")
+                    lines.append("")
+                    lines.append("</details>")
+                    lines.append("")
+                elif note:
+                    lines.append(f"*ไม่ได้ดึงเนื้อหาเต็มจากลิงก์:* {note}")
+                    lines.append("")
+
+            lines.append("---")
             lines.append("")
 
     if errors:
-        lines.append("---")
-        lines.append("")
-        lines.append("## ข้อความแจ้งปัญหา (ฟีดบางตัวอาจล่มชั่วคราว)")
+        lines.append("## ข้อความแจ้งปัญหา")
         lines.append("")
         for e in errors:
             lines.append(f"- {e}")
         lines.append("")
 
-    lines.append("---")
-    lines.append("")
-    lines.append("*หมายเหตุ: นี่คือการรวมหัวข้อจาก RSS — ไม่ใช่การสรุปความโดยโมเดลภาษา*")
+    lines.append(
+        "*หมายเหตุ: การแปลเป็นเครื่องมืออัตโนมัติ — ควรเช็คกับต้นฉบับที่ลิงก์เมื่อสำคัญ*"
+    )
     lines.append("")
     return "\n".join(lines)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ดึงข่าวจาก RSS เป็นหมวด (ไม่ใช้ AI)")
-    parser.add_argument(
-        "--section",
-        help="เลือกเฉพาะคีย์หมวด เช่น world, markets, sports",
-    )
+    parser = argparse.ArgumentParser(description="ดึงข่าว RSS แปลไทยและดึงเนื้อหาเมื่อทำได้")
+    parser.add_argument("--section", help="เฉพาะหมวด world | markets | sports")
     parser.add_argument(
         "--out",
         type=Path,
-        help="ไฟล์ผลลัพธ์ (ถ้าไม่ระบุจะเขียนไปที่ output/YYYY-MM-DD-daily-brief.md)",
+        help="ไฟล์ผลลัพธ์ (ค่าเริ่มต้น output/YYYY-MM-DD-daily-brief.md)",
     )
+    parser.add_argument("--no-translate", action="store_true", help="ไม่แปล — คงภาษาอังกฤษ")
+    parser.add_argument("--no-fetch", action="store_true", help="ไม่ดึงเนื้อหาเต็มจากลิงก์")
     args = parser.parse_args()
 
     cfg = load_config()
+    opts = merged_options(cfg)
     sections = cfg.get("sections") or {}
+
     if args.section:
         if args.section not in sections:
             print(f"ไม่มีหมวด `{args.section}` — มี: {', '.join(sections)}", file=sys.stderr)
             sys.exit(1)
         sections = {args.section: sections[args.section]}
 
+    translate = bool(opts["translate_to_thai"]) and not args.no_translate
+    fetch_body = bool(opts["fetch_article_body"]) and not args.no_fetch
+    rss_summary_max = int(opts["rss_summary_max_chars"])
+
     seen: set[str] = set()
     errors: list[str] = []
     all_items: dict[str, list[dict]] = {}
 
     for key, sec in sections.items():
-        rows = collect_section(key, sec, seen, errors)
+        rows = collect_section(key, sec, seen, errors, rss_summary_max)
+        enrich_section_items(rows, opts, translate=translate, fetch_body=fetch_body, errors=errors)
         all_items[key] = rows
 
     now = datetime.now(timezone.utc)
-    md = render_markdown(now, all_items, errors)
+    md = render_markdown(
+        now,
+        all_items,
+        errors,
+        translated=translate,
+        fetched_body=fetch_body,
+    )
 
     out_path = args.out
     if out_path is None:
         DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = DEFAULT_OUT_DIR / f"{now.strftime('%Y-%m-%d')}-daily-brief.md"
+        suffix = "-daily-brief-th.md" if translate else "-daily-brief.md"
+        out_path = DEFAULT_OUT_DIR / f"{now.strftime('%Y-%m-%d')}{suffix}"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(md, encoding="utf-8")
